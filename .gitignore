@@ -1,0 +1,14 @@
+.DS_Store
+.build/
+dist/
+__pycache__/
+*.py[cod]
+*.app/
+*.zip
+.env
+.env.*
+auth.json
+*.auth.json
+accounts.json
+profiles/
+avatars/
