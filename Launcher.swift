@@ -293,7 +293,7 @@ struct UsageRing: View {
                 .frame(width: 4, height: ringWidth)
                 .overlay(Rectangle().fill(Color.red).frame(width: 2, height: ringWidth))
                 .offset(y: -26)
-                .rotationEffect(.degrees(360 * elapsed))
+                .rotationEffect(.degrees(360 * (1 - elapsed)))
         }
         .frame(width: 52, height: 52).padding(4)
         .accessibilityHidden(true)
@@ -317,7 +317,7 @@ struct UsageView: View {
                                 Text(window.label).font(.system(size: 8, weight: .medium)).foregroundColor(.secondary)
                             }
                             .opacity(stale ? 0.6 : 1)
-                            .help("剩余额度 \(Int(100 - window.usedPercent))%；中心下方为重置倒计时；红线：周期已过 \(Int(window.elapsed(at: now) * 100))%；重置：\(Date(timeIntervalSince1970: window.resetsAt).formatted(date: .abbreviated, time: .shortened))")
+                            .help("剩余额度 \(Int(100 - window.usedPercent))%；中心下方为重置倒计时；红线：时间剩余 \(Int((1 - window.elapsed(at: now)) * 100))%；重置：\(Date(timeIntervalSince1970: window.resetsAt).formatted(date: .abbreviated, time: .shortened))")
                         }
                     }
                     if account.usageError != nil || now - usage.fetchedAt > 660 {
