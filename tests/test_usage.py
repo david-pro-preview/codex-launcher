@@ -36,11 +36,11 @@ class UsageTests(unittest.TestCase):
             self.r.capture(auth('A'))
             self.assertEqual(self.r.snapshot()['accounts'][0]['plan'],'Pro 5x')
         previous=self.r.index['accounts'][self.a]['usage']
-        with patch.object(m,'fetch_bytes',side_effect=urllib.error.HTTPError('url',401,'secret',{},None)):
+        with patch.object(m,'fetch_bytes',side_effect=urllib.error.HTTPError('url',401,'secret',{},None)), patch.object(m,'auth_consumers_running',return_value=True):
             m.refresh_usage(self.r,self.a,True)
         row=self.r.snapshot()['accounts'][0]
         self.assertEqual(row['usage'],previous)
-        self.assertIn('登录已过期',row['usageError'])
+        self.assertIn('等待当前 Codex',row['usageError'])
         self.assertNotIn('secret',json.dumps(self.r.snapshot()))
     def test_five_minute_refresh(self):
         with patch.object(m,'fetch_bytes',return_value=json.dumps(self.payload()).encode()) as fetch, patch.object(m.time,'time',return_value=1000):

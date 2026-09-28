@@ -37,7 +37,7 @@ data={
     'CFBundleDevelopmentRegion':'zh_CN', 'CFBundleDisplayName':'Codex Launcher',
     'CFBundleName':'Codex Launcher', 'CFBundleExecutable':'Codex Launcher',
     'CFBundleIdentifier':'local.kuner.codex-launcher', 'CFBundlePackageType':'APPL',
-    'CFBundleShortVersionString':'1.1.0', 'CFBundleVersion':'2',
+    'CFBundleShortVersionString':'1.2.0', 'CFBundleVersion':'3',
     'CFBundleIconFile':'AppIcon', 'LSMinimumSystemVersion':'14.0',
     'LSUIElement':True, 'NSHighResolutionCapable':True,
     'NSPrincipalClass':'NSApplication', 'LSApplicationCategoryType':'public.app-category.utilities',

@@ -97,7 +97,7 @@ open "$HOME/Applications/Codex Launcher.app"
 
 用量读取使用各账号已有的 access token，请求 ChatGPT 的 `/backend-api/wham/usage`。这是可能变化的接口；读取失败不代表额度为零。
 
-- **提示登录已过期**：重新添加该账号以更新认证。用量刷新不会主动轮换 refresh token，避免与运行中的 Codex 争用认证。
+- **自动续期**：用量接口返回 401 时先重读最新凭据，再尝试一次 token 刷新并重试用量。明确失效、撤销或已使用的 refresh token 才需要重新添加账号；网络错误会稍后重试。
 - **只有一个圆环**：接口当前仅返回一个用量周期，这是正常情况。
 - **灰色圆环 / 等待更新**：数据过期、刷新失败或上个周期已经结束。应用保留旧数据但不会假设自动恢复 100%。
 - **底部“几分钟前刷新”**：指上次刷新尝试；失败原因在相应账号卡片显示。
@@ -120,7 +120,7 @@ open "$HOME/Applications/Codex Launcher.app"
 "dist/Codex Launcher.app/Contents/MacOS/Codex Launcher" --render-preview "$PWD/.build/preview.png"
 ```
 
-当前有 28 项 Python 测试，覆盖账号保存与切换、取消恢复、互斥、进程识别、用量解析和刷新缓存。另有原生解码和周期进度检查。真实多账号切换会终止相关应用，请不要在 Codex 正执行任务时测试。
+当前有 42 项 Python 测试，覆盖账号保存与切换、取消恢复、互斥、进程识别、用量解析和刷新缓存。另有原生解码和周期进度检查。真实多账号切换会终止相关应用，请不要在 Codex 正执行任务时测试。
 
 ## 给协助安装的 Codex
 
@@ -131,3 +131,25 @@ open "$HOME/Applications/Codex Launcher.app"
 订阅名称映射与用量接口参考 [CodexBar](https://github.com/steipete/CodexBar/tree/main/Sources/CodexBarCore/Providers/Codex)。
 
 应用图标为生成的自定义图像；菜单栏图标来自本机 OpenAI 桌面应用的模板图标。OpenAI / ChatGPT 名称和标识属于其各自权利人，本项目不代表其官方产品或授权。界面预览中的姓名和邮箱为虚构数据。
+
+## 自动续期实现
+
+启动器采用 Codex 的 OAuth JSON refresh grant：POST `https://auth.openai.com/oauth/token`，使用 `grant_type=refresh_token`、Codex 的公共 client ID 和本地保存的 refresh token。令牌只通过 HTTPS 请求体发送，不进入命令行参数或日志；不启动模型任务。
+
+- 每次用量请求前先同步当前 `auth.json`；401 后若文件已有新 token，优先重试新 token。
+- 未使用的账号可在后台自动续期；新凭据以 600 权限原子保存后，再重试用量。只有实际返回的 token 字段会被替换，账号身份必须保持一致。
+- 同一用户的多个工作区若共享同一个 refresh token，会同步新 token，保留各自的工作区 ID。
+- 当前账号（包括同一用户的其他工作区）存在运行中的 Codex/桌面/IDE 进程时，显示「等待当前 Codex 自动续期」，不另起刷新请求；原进程写入的新凭据会在后续检查中同步。**这不是强制当前进程立即续期**，原进程没有刷新时该状态可能持续。没有消费者进程时，可以续期当前账号并回写其未变化的 `auth.json`。
+- 401 只触发一次 refresh grant，重试仍失败不会循环刷新。403、429、服务端错误不触发 token 刷新。
+- `invalid_grant`、refresh token 过期/撤销/已使用等明确永久错误会按凭据版本缓存，避免每 5 分钟反复请求；重新登录或凭据变化后可重新尝试。
+- 启动器操作共享互斥锁。外部程序不受该锁控制，所以刷新前后还会校验文件版本；发现外部修改时不会覆盖新登录，必要时将已轮换的凭据保存在私有 `profiles/recovery-*.json` 中。无法协调其他机器或独立 CODEX_HOME 中同一凭据的使用。
+
+### 为什么没有启动独立 CODEX_HOME
+
+官方 `account/read` 支持 `refreshToken: true`，独立 app-server 的确能够刷新自己的 `auth.json`。但源码的 `refresh_lock` 是进程内 semaphore，不能防止两个实例同时使用同一 refresh token；隔离目录只隔离文件，不隔离服务端的 token 轮换。直接调用同一刷新协议更轻量，也便于区分永久和暂时错误。此处沿用 Codex 的「先重读凭据再刷新」思路，额外避免与当前进程主动竞争。
+
+研究依据（固定源码版本，便于核对）：
+
+- [Codex AuthManager：重读、OAuth 请求、持久化和失败分类](https://github.com/openai/codex/blob/44fe510ce3ee61c8ef623adcbf89b901c73ddd61/codex-rs/login/src/auth/manager.rs)
+- [account/read 的 refreshToken 处理](https://github.com/openai/codex/blob/44fe510ce3ee61c8ef623adcbf89b901c73ddd61/codex-rs/app-server/src/request_processors/account_processor/workspace_routing.rs)
+- [官方刷新行为测试](https://github.com/openai/codex/blob/44fe510ce3ee61c8ef623adcbf89b901c73ddd61/codex-rs/login/tests/suite/auth_refresh.rs)

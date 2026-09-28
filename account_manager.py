@@ -6,6 +6,7 @@ Stdout is a JSON event stream. Credentials and raw login output are never emitte
 import argparse
 import base64
 import contextlib
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -313,29 +314,195 @@ def parse_usage(data, account_id, now):
     return {'windows': windows, 'fetchedAt': now}
 
 
+class RefreshFailure(UserError):
+    def __init__(self, message, permanent=False):
+        super().__init__(message)
+        self.permanent = permanent
+
+
+def credential_key(raw):
+    return hashlib.sha256(json.dumps(parse_auth(raw)[2], sort_keys=True).encode()).hexdigest()
+
+
+def current_profile(registry, identifier):
+    """Prefer the live file: Codex may already have rotated this account's tokens."""
+    current = registry.read_current()
+    if current and parse_auth(current)[0] == identifier:
+        registry.capture(current)
+    return registry.profile_path(identifier).read_bytes()
+
+
+def auth_consumers_running():
+    # Include regular CLI sessions as well as desktop/IDE app-servers. Never stop them.
+    return any(is_target(row) or Path(row['executable']).name == 'codex'
+               for row in process_table())
+
+
+def request_token_refresh(raw):
+    """Mirror codex-login's JSON refresh grant; never log HTTP bodies or tokens."""
+    identifier, _, tokens = parse_auth(raw)
+    body = json.dumps({'client_id': 'app_EMoamEEZ73f0CkXaXp7hrann',
+                       'grant_type': 'refresh_token',
+                       'refresh_token': tokens['refresh_token']}).encode()
+    request = urllib.request.Request('https://auth.openai.com/oauth/token', data=body,
+        headers={'Content-Type': 'application/json', 'Accept': 'application/json'}, method='POST')
+    try:
+        opener = urllib.request.build_opener(NoRedirect())
+        with opener.open(request, timeout=15) as response:
+            payload = response.read(1024 * 1024 + 1)
+            if len(payload) > 1024 * 1024:
+                raise ValueError()
+            result = json.loads(payload)
+    except urllib.error.HTTPError as error:
+        try:
+            detail = json.loads(error.read(65536))
+            value = detail.get('error') if isinstance(detail, dict) else None
+            code = value.get('code') or value.get('type') if isinstance(value, dict) else value
+            code = code.lower() if isinstance(code, str) else ''
+        except Exception:
+            code = ''
+        finally:
+            error.close()
+        permanent = error.code == 401 or code in (
+            'refresh_token_expired', 'refresh_token_reused', 'refresh_token_invalidated', 'invalid_grant')
+        raise RefreshFailure('登录无法自动续期，请重新添加此账号' if permanent
+                             else '自动续期暂时失败，稍后重试', permanent) from None
+    except Exception:
+        raise RefreshFailure('自动续期暂时失败，稍后重试') from None
+    try:
+        if not isinstance(result, dict) or not any(result.get(name) for name in ('id_token', 'access_token', 'refresh_token')):
+            raise ValueError()
+        updated = json.loads(raw)
+        for name in ('id_token', 'access_token', 'refresh_token'):
+            if result.get(name) is not None:
+                if not isinstance(result[name], str) or not result[name]:
+                    raise ValueError()
+                updated['tokens'][name] = result[name]
+        updated['last_refresh'] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        candidate = json.dumps(updated).encode()
+        if parse_auth(candidate)[0] != identifier:
+            raise ValueError()
+        return candidate
+    except Exception:
+        raise RefreshFailure('自动续期返回信息异常，已保留原登录') from None
+
+
+def renew_profile(registry, identifier, expected):
+    """Called under Registry.locked(); at most one refresh grant per usage check."""
+    latest = current_profile(registry, identifier)
+    if credential_key(latest) != credential_key(expected):
+        return latest
+    record = registry.index['accounts'][identifier]
+    key = credential_key(latest)
+    if record.get('refreshFailureKey') == key:
+        raise RefreshFailure('登录无法自动续期，请重新添加此账号', True)
+    _, claims, tokens = parse_auth(latest)
+    current = registry.read_current()
+    current_claims = parse_auth(current)[1] if current else {}
+    # Workspace IDs can differ while sharing one OAuth identity/token family.
+    if current_claims.get('sub') == claims['sub'] and auth_consumers_running():
+        raise RefreshFailure('等待当前 Codex 自动续期')
+    # Also refuse to rotate a saved profile that changed during preflight.
+    if credential_key(current_profile(registry, identifier)) != key:
+        return current_profile(registry, identifier)
+    try:
+        refreshed = request_token_refresh(latest)
+    except RefreshFailure as error:
+        if error.permanent:
+            registry.index['accounts'][identifier]['refreshFailureKey'] = key
+            registry.save_index()
+        raise
+    if parse_auth(refreshed)[0] != identifier:
+        raise RefreshFailure('自动续期账号不匹配，已保留原登录')
+    # Persist rotated credentials before any optional metadata/usage operations.
+    # Keep a recovery file if a concurrent external writer changed the profile.
+    if credential_key(registry.profile_path(identifier).read_bytes()) != key:
+        atomic_write(registry.profiles / ('recovery-' + uuid.uuid4().hex + '.json'), refreshed)
+        raise RefreshFailure('登录在续期期间发生变化，请刷新后重试')
+    registry.capture(refreshed)
+    _, _, new_tokens = parse_auth(refreshed)
+    # Profiles for two workspaces may share a refresh token. Propagate the new
+    # token family while preserving each workspace's account_id and identity.
+    for other_id in list(registry.index['accounts']):
+        if other_id == identifier:
+            continue
+        other_raw = registry.profile_path(other_id).read_bytes()
+        _, other_claims, other_tokens = parse_auth(other_raw)
+        if other_claims['sub'] == claims['sub'] and other_tokens['refresh_token'] == tokens['refresh_token']:
+            other = json.loads(other_raw)
+            for name in ('id_token', 'access_token', 'refresh_token'):
+                other['tokens'][name] = new_tokens[name]
+            other['last_refresh'] = json.loads(refreshed)['last_refresh']
+            candidate = json.dumps(other).encode()
+            if parse_auth(candidate)[0] == other_id:
+                registry.capture(candidate)
+    # Do not replace an account selected or refreshed by an external login.
+    live = registry.read_current()
+    if current and live and parse_auth(live)[1]['sub'] == claims['sub']:
+        _, _, live_tokens = parse_auth(live)
+        if live_tokens['refresh_token'] == tokens['refresh_token'] and credential_key(live) == credential_key(current):
+            live_id = parse_auth(live)[0]
+            if live_id in registry.index['accounts']:
+                atomic_write(registry.auth, registry.profile_path(live_id).read_bytes())
+    registry.index['accounts'][identifier].pop('refreshFailureKey', None)
+    registry.save_index()
+    return refreshed
+
+
+def fetch_usage_with_auth(raw):
+    _, _, tokens = parse_auth(raw)
+    headers = {'Authorization': 'Bearer ' + tokens['access_token'],
+               'ChatGPT-Account-Id': tokens['account_id'],
+               'User-Agent': 'CodexLauncher/1.2', 'Accept': 'application/json'}
+    data = json.loads(fetch_bytes('https://chatgpt.com/backend-api/wham/usage', headers, 1024 * 1024))
+    return data, tokens['account_id']
+
+
 def refresh_usage(registry, identifier, force=False):
     record = registry.index['accounts'][identifier]
     now = time.time()
     if not force and now - record.get('usageCheckedAt', 0) < 300:
         return
     try:
-        actual_id, _, tokens = parse_auth(registry.profile_path(identifier).read_bytes())
-        if actual_id != identifier:
+        raw = current_profile(registry, identifier)
+        if parse_auth(raw)[0] != identifier:
             raise ValueError()
-        headers = {'Authorization': 'Bearer ' + tokens['access_token'],
-                   'ChatGPT-Account-Id': tokens['account_id'],
-                   'User-Agent': 'CodexLauncher/1.1', 'Accept': 'application/json'}
-        data = json.loads(fetch_bytes('https://chatgpt.com/backend-api/wham/usage', headers, 1024 * 1024))
-        record['usage'] = parse_usage(data, tokens['account_id'], now)
+        try:
+            data, account_id = fetch_usage_with_auth(raw)
+        except urllib.error.HTTPError as error:
+            if error.code != 401:
+                raise
+            error.close()
+            # Retry a newer live token before considering any refresh grant.
+            latest = current_profile(registry, identifier)
+            if credential_key(latest) != credential_key(raw):
+                raw = latest
+                try:
+                    data, account_id = fetch_usage_with_auth(raw)
+                except urllib.error.HTTPError as retry_error:
+                    if retry_error.code != 401:
+                        raise
+                    retry_error.close()
+                    raw = renew_profile(registry, identifier, raw)
+                    data, account_id = fetch_usage_with_auth(raw)
+            else:
+                raw = renew_profile(registry, identifier, raw)
+                data, account_id = fetch_usage_with_auth(raw)
+        record = registry.index['accounts'][identifier]
+        record['usage'] = parse_usage(data, account_id, time.time())
         plan = safe_text(data.get('plan_type'))
         if plan:
             record['plan'], record['planSource'] = plan, 'usage'
         record.pop('usageError', None)
+        record.pop('refreshFailureKey', None)
+    except RefreshFailure as error:
+        registry.index['accounts'][identifier]['usageError'] = str(error)
     except urllib.error.HTTPError as error:
-        record['usageError'] = '登录已过期，请重新添加此账号' if error.code == 401 else '用量暂时无法更新'
+        registry.index['accounts'][identifier]['usageError'] = '续期后用量仍无法读取，稍后重试' if error.code == 401 else '用量暂时无法更新'
+        error.close()
     except Exception:
-        record['usageError'] = '用量暂时无法更新'
-    record['usageCheckedAt'] = now
+        registry.index['accounts'][identifier]['usageError'] = '用量暂时无法更新'
+    registry.index['accounts'][identifier]['usageCheckedAt'] = time.time()
     registry.save_index()
 
 
